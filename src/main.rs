@@ -1,3 +1,11 @@
+//! Only two parameteres are required: source and destination. Apart from that, you can specify if you want to remove the source (move the files) and the concurrency level. For example:
+//!
+//!```
+//!rs-copier --source data_origin --destination data_destination --delete-source true --concurrency 20
+//!```
+//!
+//!But you can always run with `--help` to get more details
+
 use std::vec;
 use std::path::PathBuf;
 use anyhow::Result;
@@ -76,6 +84,10 @@ fn setup_logger(loglevel: &str, logfile: Option<&str>) -> Result<()>{
 }
 
 /// Arguments parser
+/// `--source` the source directory
+/// `--destination` the destination directory
+/// `--delete-source` to act like moving (first copy and the remove the source file)
+/// `--concurrency` to set the maximum concurrency
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
