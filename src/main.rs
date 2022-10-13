@@ -6,13 +6,13 @@ use log::{info, debug, error};
 use std::path::Path;
 use clap::Parser;
 
-
-async fn process_directory(source: &PathBuf, dest: &PathBuf, remove_source: bool) -> Result<Vec<PathBuf>> {
-    info!("Processing: {:?}", source);
+/// Copy all the files of the directory from source to dest. Remove the source files if remove_source = true
+/// Then list all the directories and return them.
+async fn process_directory(source: &Path, dest: &Path, remove_source: bool) -> Result<Vec<PathBuf>> {
+    info!("Processing dir: {:?}", source);
     let mut paths = tokio::fs::read_dir(&source).await?;
     tokio::fs::create_dir_all(&dest).await?;
     let mut directories = vec![];
-    let mut remove_dir = true;
     while let Some(path) = paths.next_entry().await? {
         match path.file_type().await {
             Ok(file_type) => {
@@ -27,7 +27,6 @@ async fn process_directory(source: &PathBuf, dest: &PathBuf, remove_source: bool
                         if remove_source {
                             if let Err(error) = tokio::fs::remove_file(&from).await {
                                 error!("Cannot remove file: {:?}: {:?}", from, error);
-                                remove_dir = false;
                             }
                         }
                     }
@@ -40,14 +39,10 @@ async fn process_directory(source: &PathBuf, dest: &PathBuf, remove_source: bool
             }
         }  
     }
-    if remove_source && directories.is_empty() && remove_dir {
-        if let Err(error) = tokio::fs::remove_dir(&source).await {
-            error!("Cannot remove directory: {:?}: {:?}", source, error);
-        }
-    }
     Ok(directories)
 }
 
+/// Logger configuration
 fn setup_logger(loglevel: &str, logfile: Option<&str>) -> Result<()>{   
     let level = match loglevel {
         "INFO" => log::LevelFilter::Info,
@@ -80,6 +75,7 @@ fn setup_logger(loglevel: &str, logfile: Option<&str>) -> Result<()>{
 
 }
 
+/// Arguments parser
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -89,6 +85,12 @@ struct Args {
    /// Name of the person to greet
    #[clap(short, long, value_parser)]
    destination: String,
+   /// Delete source or not
+   #[clap(long, value_parser, default_value = "false")]
+   delete_source: bool,
+   /// Concurrency
+   #[clap(long, value_parser, default_value = "10")]
+   concurrency: usize,
 }
 
 
@@ -98,58 +100,168 @@ async fn main() -> Result<()> {
 
     setup_logger("INFO", None::<&str>)?;
 
-    let source = args.source;
-    let dest = args.destination;
-    let batch_size = 50;
-    //let tasks = vec![];
+    let base_source = PathBuf::from(args.source);
+    let base_dest = PathBuf::from(args.destination);
+    let delete_source = args.delete_source;
+    let batch_size = args.concurrency;
+    if delete_source {
+        info!("Source files will be deleted once copied");
+    }
+    
+    if !base_source.exists() {
+        return Err(anyhow::anyhow!("Source directory does not exist"));
+    }
+
+    info!("The concurrency is set to {batch_size}");
+
     let mut set = JoinSet::new();
-    let dirs = process_directory(&(&source).into(), &(&dest).into(), false).await?;
-    for dir in dirs {
-        
-        let dir_dest = Path::new(&dest).join(&dir.strip_prefix(&source)?);
-        let subdirs = process_directory(&dir, &dir_dest, false).await.unwrap();
-        for subdir in subdirs {
-            let dir_dest = Path::new(&dest).join(&dir.strip_prefix(&source)?);
-            let sub_source = source.to_owned();
-            let sub_dest = dir_dest.to_owned();
-            set.spawn(async move {
-                let d = sub_dest.join(subdir.strip_prefix(&sub_source).unwrap());
-                process_directory(&subdir, &d, true).await.unwrap();
-                d
-            });
-            if set.len() >= batch_size {
-                // Max concurrency
-                if let Some(res) = set.join_next().await {
-                    match res {
-                        Ok(dir) => {
-                            info!("Done {:?}", dir);
-                        },
-                        Err(err) => {
-                            error!("Error {:?}", err);
-                        }
+    let mut dirs = process_directory(&base_source.clone(), &base_dest.clone(), delete_source).await?;
+    
+    while let Some(dir) = dirs.pop() {
+        let dest = base_dest.join(dir.strip_prefix(&base_source).unwrap());
+        set.spawn(async move {            
+            process_directory(&dir, &dest, delete_source).await.unwrap()
+        });
+
+        if set.len() >= batch_size {
+            // Max concurrency
+            if let Some(res) = set.join_next().await {
+                match res {
+                    Ok(mut new_dirs) => {
+                        dirs.append(&mut new_dirs);
+                    },
+                    Err(err) => {
+                        error!("Error {:?}", err);
                     }
                 }
             }
-
-        }
-        
-            
-        
-        
-    }
-    //Pending tasks
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(dir) => {
-                info!("Done {:?}", dir);
-            },
-            Err(err) => {
-                error!("Error {:?}", err);
-            }
         }
     }
 
+    // Remove source (which is only the directory structure empty of files)
+    if delete_source {
+        tokio::fs::remove_dir_all(base_source).await?;
+    }
     info!("All done");
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use super::process_directory;
+
+    const BASE_DIR: &str = "/tmp/test";
+
+    async fn init(name: &str) -> PathBuf {
+        let base_dir = PathBuf::from(BASE_DIR).join(name);
+        
+        if base_dir.exists() {
+            tokio::fs::remove_dir_all(&base_dir).await.unwrap();
+        }
+        tokio::fs::create_dir_all(&base_dir).await.unwrap();
+        
+        base_dir
+    }
+
+    #[tokio::test]
+    async fn empty_directory() {
+        let base_dir = init("empty_directory").await;
+        
+        let source = base_dir.join("source");
+        let dest = base_dir.join("dest");
+        assert_eq!(dest.exists(), false);
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        process_directory(&source, &dest, false).await.unwrap();
+
+        assert_eq!(source.exists(), true);
+        assert_eq!(dest.exists(), true);
+    }
+
+    #[tokio::test]
+    async fn only_files() {
+        let base_dir = init("only_files").await;
+
+        let source = base_dir.join("source");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        let dest = base_dir.join("dest");
+        tokio::fs::write(source.join("file1"), "text").await.unwrap();
+        tokio::fs::write(source.join("file2"), "text").await.unwrap();
+        assert_eq!(dest.exists(), false);
+        process_directory(&source, &dest, false).await.unwrap();
+
+        assert_eq!(source.join("file1").exists(), true);
+        assert_eq!(source.join("file2").exists(), true);
+        
+        assert_eq!(dest.exists(), true);
+        assert_eq!(dest.join("file1").exists(), true);
+        assert_eq!(dest.join("file2").exists(), true);
+    }
+
+    #[tokio::test]
+    async fn only_files_delete() {
+        let base_dir = init("only_files_delete").await;
+
+        let source = base_dir.join("source");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        tokio::fs::write(source.join("file1"), "text").await.unwrap();
+        tokio::fs::write(source.join("file2"), "text").await.unwrap();
+        let dest = base_dir.join("dest");
+        assert_eq!(dest.exists(), false);
+        let res = process_directory(&source, &dest, true).await.unwrap();
+
+        assert_eq!(source.join("file1").exists(), false);
+        assert_eq!(source.join("file2").exists(), false);
+        
+        assert_eq!(dest.exists(), true);
+        assert_eq!(dest.join("file1").exists(), true);
+        assert_eq!(dest.join("file2").exists(), true);
+        assert_eq!(res.len(), 0);
+    }
+
+
+    #[tokio::test]
+    async fn nested() {
+        let base_dir = init("nested").await;
+
+        let source = base_dir.join("source");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        let dest = base_dir.join("dest");
+        tokio::fs::write(source.join("file1"), "text").await.unwrap();
+        tokio::fs::write(source.join("file2"), "text").await.unwrap();
+        let nested = source.join("nested");
+        tokio::fs::create_dir_all(source.join("nested")).await.unwrap();
+        tokio::fs::write(nested.join("file3"), "text").await.unwrap();
+        tokio::fs::write(nested.join("file4"), "text").await.unwrap();
+
+        assert_eq!(dest.exists(), false);
+        let res = process_directory(&source, &dest, false).await.unwrap();
+
+        assert_eq!(source.join("file1").exists(), true);
+        assert_eq!(source.join("file2").exists(), true);
+        
+        
+        
+        assert_eq!(dest.exists(), true);
+        assert_eq!(dest.join("file1").exists(), true);
+        assert_eq!(dest.join("file2").exists(), true);
+        
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0], base_dir.join("source").join("nested"));
+
+        let nested_dest = base_dir.join("dest").join("nested");
+        
+        let res = process_directory(&res[0], &nested_dest, false).await.unwrap();
+        
+        assert_eq!(res.len(), 0);
+        
+        
+        assert_eq!(nested_dest.exists(), true);
+        assert_eq!(nested_dest.join("file3").exists(), true);
+        assert_eq!(nested_dest.join("file4").exists(), true);
+    }
+
+    
 }
